@@ -318,6 +318,7 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
         self,
         path: Optional[str | Path] = None,
         quality: int = 100,
+        scale: int = 1,
         as_base64: bool = False,
     ) -> Optional[str]:
         """
@@ -362,7 +363,7 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
             y=bounds['y'],
             width=bounds['width'],
             height=bounds['height'],
-            scale=1,
+            scale=scale,
         )
         logger.debug(
             f'Taking element screenshot: path={path}, quality={quality}, as_base64={as_base64}, '
