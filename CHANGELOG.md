@@ -1,3 +1,169 @@
+## 2.23.0 (2026-05-22)
+
+### Feat
+
+- enhance connection resilience and event handling in ConnectionHandler and managers
+- implement User-Agent override propagation to worker contexts
+
+### Fix
+
+- avoid shared mutable default for WebElement attributes_list
+
+### Refactor
+
+- inject connection handler and managers for testability
+
+## 2.22.1 (2026-04-10)
+
+### Fix
+
+- **requests**: surface JavaScript fetch errors with descriptive messages
+- **requests**: surface JavaScript fetch errors with descriptive messages
+- **requests**: surface JavaScript fetch errors with descriptive messages
+- **requests**: surface JavaScript fetch errors with descriptive messages
+- **test**: await canceled receiver task to avoid pending-task leaks
+- add humanize to WebElement.click
+- update broken webelement-domain link in element-finding.md
+- update broken deep-dive links in core-concepts.md
+
+## 2.22.0 (2026-03-23)
+
+### Feat
+
+- **extractor**: integrate extract and extract_all into Tab
+- **extractor**: add module public API exports
+- **extractor**: add extraction engine with CSS/XPath support
+- **extractor**: add ExtractionModel base class
+- **extractor**: add Field descriptor and ExtractionMetadata
+- **extractor**: add extraction exception hierarchy
+- add pydantic as required dependency
+- add missing CDP enum values for AXPropertyName
+- add missing enum values for AXPropertyName
+- impl accesiblity domain
+
+### Fix
+
+- **test**: filter only DeprecationWarning in interval deprecated test
+- **extractor**: correct coroutine type annotation for mypy
+- **extractor**: resolve mypy type errors
+- detect navigation errors on same-URL refresh in go_to
+- use NavigateResponse type instead of dict with type ignore
+- add type annotation to satisfy mypy var-annotated check
+- add type annotation for navigate response
+- raise NavigationError when go_to fails
+
+### Refactor
+
+- **extractor**: parallelize list field extraction with asyncio.gather
+- **extractor**: use asyncio.gather for concurrent field extraction
+
+## 2.21.3 (2026-03-14)
+
+### Fix
+
+- **test**: improve OOPIF integration test reliability
+- **iframe**: resolve nested OOPIF iframes inside shadow roots
+
+## 2.21.2 (2026-03-12)
+
+### Fix
+
+- release commit
+
+## 2.21.1 (2026-03-03)
+
+### Fix
+
+- **keyboard**: send correct key, code and keycode in type_text
+- **elements**: fix humanized interactions inside iframes
+- humanized scroll overshoot correction causes infinite loop
+
+## 2.21.0 (2026-03-01)
+
+### Feat
+
+- **interactions**: change humanize default from True to False
+
+### Fix
+
+- **elements**: forward humanize flag to click in type_text
+
+## 2.20.2 (2026-02-18)
+
+### Fix
+
+- **command**: increase default command timeout from 10s to 60s across multiple components
+- **tab**: remove temporary flag to avoid duplicate callback removal
+
+## 2.20.1 (2026-02-16)
+
+### Fix
+
+- **tab**: replace readyState polling with CDP events in navigation
+
+## 2.20.0 (2026-02-13)
+
+### Feat
+
+- **mouse**: add timing property for runtime configuration
+- **requests**: add record() and replay() to Request class
+- **requests**: add HAR network recorder
+- **protocol**: add HAR 1.2 type definitions
+
+### Fix
+
+- **requests**: use surgical callback removal instead of nuclear clear_callbacks
+
+### Refactor
+
+- **tab**: extract bundle static methods to utils module
+
+## 2.19.0 (2026-02-12)
+
+### Feat
+
+- **interactions**: default humanize=True for keyboard type_text
+- **elements**: integrate Mouse API into WebElement.click()
+- **interactions**: add Mouse API with humanized simulation
+- **browser**: add webrtc_leak_protection property to ChromiumOptions
+- **browser**: add automatic User-Agent consistency override
+
+### Fix
+
+- **utils**: harden SOCKS5 proxy forwarder security and robustness
+
+## 2.18.0 (2026-02-11)
+
+### Feat
+
+- **utils**: add SOCKS5 proxy forwarder and convert utils to package
+- **elements**: add cross-iframe selector support for XPath and CSS
+
+## 2.17.0 (2026-02-08)
+
+### Feat
+
+- **tab**: refactor cloudflare bypass to use shadow root traversal
+- **elements**: add shadow root timeout, CSS restriction and context propagation
+- **tab**: add find_shadow_roots with OOPIF traversal and timeout
+- **elements**: add shadow DOM support
+
+### Fix
+
+- **docs**: replace shadow.find() with query() in all documentation
+- **tests**: replace shadow.find() with query() in integration tests
+- **elements**: use float timeout and add contextual WaitElementTimeout messages
+
+## 2.16.0 (2026-02-06)
+
+### Feat
+
+- add clear method for input and enhance page load state handling
+
+### Fix
+
+- **browser**: support secure websocket connections
+
 ## 2.15.1 (2026-01-04)
 
 ### Fix

@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import json as jsonlib
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+from pydoll.browser.requests.har_recorder import HarCapture, HarRecorder
 from pydoll.browser.requests.response import Response
 from pydoll.commands.runtime_commands import RuntimeCommands
 from pydoll.constants import Scripts
@@ -23,7 +26,7 @@ from pydoll.protocol.network.events import (
     ResponseReceivedExtraInfoEvent,
     ResponseReceivedExtraInfoEventParams,
 )
-from pydoll.protocol.network.types import CookieParam
+from pydoll.protocol.network.types import CookieParam, ResourceType
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +90,7 @@ class Request:
         """
         self.tab = tab
         self._network_events_enabled = False
+        self._callback_ids: list[int] = []
         self._requests_sent: list[RequestSentEvent] = []
         self._requests_received: list[RequestReceivedEvent] = []
         logger.debug('Request helper initialized for tab')
@@ -144,15 +148,17 @@ class Request:
         )
         try:
             result = await self._execute_fetch_request(final_url, options)
+        except Exception as exc:
+            logger.error(f'Request failed: {exc}')
+            raise HTTPError(f'Request failed: {str(exc)}') from exc
+        else:
+            result_value = result['result']['result']['value']
+            if 'error' in result_value:
+                raise HTTPError(f'Fetch error: {result_value["error"]}')
             received_headers = self._extract_received_headers()
             sent_headers = self._extract_sent_headers()
             cookies = self._extract_set_cookies()
             return self._build_response(result, received_headers, sent_headers, cookies)
-
-        except Exception as exc:
-            logger.error(f'Request failed: {exc}')
-            raise HTTPError(f'Request failed: {str(exc)}') from exc
-
         finally:
             await self._clear_callbacks()
 
@@ -274,6 +280,46 @@ class Request:
             Response object with allowed methods and CORS headers.
         """
         return await self.request('OPTIONS', url, **kwargs)
+
+    @asynccontextmanager
+    async def record(
+        self,
+        resource_types: list[ResourceType] | None = None,
+    ) -> AsyncIterator[HarCapture]:
+        """Record network traffic as HAR.
+
+        Context manager that captures all network activity on the tab
+        and produces a HarCapture object for export.
+
+        Args:
+            resource_types: Optional list of resource types to capture.
+                When provided, only requests matching these types are
+                recorded. When None (default), all resource types are
+                captured.
+
+        Usage::
+
+            async with tab.request.record() as capture:
+                await tab.go_to('https://example.com')
+            capture.save('flow.har')
+
+            # Record only fetch and XHR requests
+            async with tab.request.record(
+                resource_types=[ResourceType.FETCH, ResourceType.XHR]
+            ) as capture:
+                await tab.go_to('https://example.com')
+            capture.save('api_calls.har')
+
+        Yields:
+            HarCapture: Object with .save(), .to_dict(), and .entries.
+        """
+        recorder = HarRecorder(self.tab, resource_types=resource_types)
+        capture = HarCapture(recorder)
+        await recorder.start()
+        try:
+            yield capture
+        finally:
+            await recorder.stop()
 
     @staticmethod
     def _build_url_with_params(url: str, params: Optional[dict[str, str]]) -> str:
@@ -398,35 +444,39 @@ class Request:
             self._requests_sent.append(cast(RequestSentEvent, event))
             logger.debug(f'Appended sent request: event={event}')
 
-        await self.tab.on(
-            NetworkEvent.REQUEST_WILL_BE_SENT,
-            callback=append_sent_request,
-        )
-        await self.tab.on(
-            NetworkEvent.REQUEST_WILL_BE_SENT_EXTRA_INFO,
-            callback=append_sent_request,
-        )
-        await self.tab.on(
-            NetworkEvent.RESPONSE_RECEIVED,
-            callback=append_received_request,
-        )
-        await self.tab.on(
-            NetworkEvent.RESPONSE_RECEIVED_EXTRA_INFO,
-            callback=append_received_request,
-        )
+        self._callback_ids = [
+            await self.tab.on(
+                NetworkEvent.REQUEST_WILL_BE_SENT,
+                callback=append_sent_request,
+            ),
+            await self.tab.on(
+                NetworkEvent.REQUEST_WILL_BE_SENT_EXTRA_INFO,
+                callback=append_sent_request,
+            ),
+            await self.tab.on(
+                NetworkEvent.RESPONSE_RECEIVED,
+                callback=append_received_request,
+            ),
+            await self.tab.on(
+                NetworkEvent.RESPONSE_RECEIVED_EXTRA_INFO,
+                callback=append_received_request,
+            ),
+        ]
 
     async def _clear_callbacks(self) -> None:
         """Clean up network event listeners and disable network monitoring.
 
-        Removes all registered event callbacks and disables network events
-        if they were enabled by this request instance.
+        Removes only the callbacks registered by this request instance
+        (surgical removal) so other listeners (e.g. HarRecorder) are
+        not affected.
         """
+        for callback_id in self._callback_ids:
+            await self.tab.remove_callback(callback_id)
+        self._callback_ids.clear()
         if self._network_events_enabled:
             await self.tab.disable_network_events()
             self._network_events_enabled = False
             logger.debug('Network events disabled on tab after request')
-        await self.tab.clear_callbacks()
-        logger.debug('Cleared network callbacks on tab')
 
     def _extract_received_headers(self) -> list[HeaderEntry]:
         """Extract headers from response network events.

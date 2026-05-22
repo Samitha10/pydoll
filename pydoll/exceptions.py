@@ -181,6 +181,12 @@ class ElementNotAFileInput(ElementException):
     message = 'The element is not a file input'
 
 
+class ShadowRootNotFound(ElementException):
+    """Raised when an element does not have an attached shadow root."""
+
+    message = 'No shadow root attached to this element'
+
+
 class TimeoutException(PydollException):
     """Base class for exceptions related to timeouts."""
 
@@ -203,6 +209,17 @@ class DownloadTimeout(TimeoutException):
     """Raised when waiting for a file download to complete times out."""
 
     message = 'Timed out waiting for download to complete'
+
+
+class NavigationError(PydollException):
+    """Raised when page navigation fails (e.g., DNS resolution failure)."""
+
+    def __init__(self, url: str, error_text: str):
+        self.url = url
+        self.error_text = error_text
+        super().__init__(
+            message=f'Navigation to {url} failed: {error_text}',
+        )
 
 
 class ConfigurationException(PydollException):
@@ -299,6 +316,12 @@ class HTTPError(RequestException):
     """Exception raised for HTTP error responses (4xx and 5xx status codes)."""
 
     message = 'An HTTP error occurred'
+
+
+class HarRecordingError(RequestException):
+    """Raised when HAR recording fails."""
+
+    message = 'HAR recording error occurred'
 
 
 class ScriptException(PydollException):

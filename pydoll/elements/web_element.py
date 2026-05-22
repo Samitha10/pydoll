@@ -21,6 +21,7 @@ from pydoll.constants import (
     Scripts,
 )
 from pydoll.elements.mixins import FindElementsMixin
+from pydoll.elements.shadow_root import ShadowRoot
 from pydoll.exceptions import (
     ElementNotAFileInput,
     ElementNotFound,
@@ -29,10 +30,12 @@ from pydoll.exceptions import (
     InvalidFileExtension,
     InvalidIFrame,
     MissingScreenshotPath,
+    ShadowRootNotFound,
     WaitElementTimeout,
 )
 from pydoll.interactions.iframe import IFrameContext, IFrameContextResolver
 from pydoll.interactions.keyboard import Keyboard
+from pydoll.protocol.dom.types import ShadowRootType
 from pydoll.protocol.input.types import (
     KeyEventType,
     KeyModifier,
@@ -54,9 +57,12 @@ from pydoll.utils import (
 )
 
 if TYPE_CHECKING:
+    from pydoll.interactions.mouse import Mouse as MouseType
     from pydoll.protocol.dom.methods import (
+        DescribeNodeResponse,
         GetBoxModelResponse,
         GetOuterHTMLResponse,
+        ResolveNodeResponse,
     )
     from pydoll.protocol.dom.types import Quad
     from pydoll.protocol.page.methods import CaptureScreenshotResponse
@@ -84,7 +90,8 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
         connection_handler: ConnectionHandler,
         method: Optional[str] = None,
         selector: Optional[str] = None,
-        attributes_list: list[str] = [],
+        attributes_list: Optional[list[str]] = None,
+        mouse: Optional['MouseType'] = None,
     ):
         """
         Initialize WebElement wrapper.
@@ -95,6 +102,16 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
             method: Search method used to find this element (for debugging).
             selector: Selector string used to find this element (for debugging).
             attributes_list: Flat list of alternating attribute names and values.
+            mouse: Optional Mouse instance for humanized click behavior.
+
+        Note:
+            Mouse and Keyboard follow different ownership strategies. Mouse is a shared
+            instance from Tab, passed down to elements to preserve cursor position state
+            across interactions. It dispatches commands through Tab._execute_command, which
+            means it has no iframe context awareness. Keyboard is created per-element and
+            routes commands through the element's own _execute_command, correctly handling
+            iframe routing. For iframe elements, the mouse is intentionally skipped during
+            humanized clicks (see click()) to avoid dispatching events to the wrong frame.
         """
         self._object_id = object_id
         self._search_method = method
@@ -102,9 +119,10 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
         self._connection_handler = connection_handler
         self._attributes: dict[str, str] = {}
         self._keyboard: Optional[Keyboard] = None
+        self._mouse = mouse
         self._iframe_context: Optional[IFrameContext] = None
         self._iframe_resolver: Optional[IFrameContextResolver] = None
-        self._def_attributes(attributes_list)
+        self._def_attributes(attributes_list or [])
         logger.debug(
             f'WebElement initialized: object_id={self._object_id}, '
             f'method={self._search_method}, selector={self._selector}, '
@@ -122,6 +140,11 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
         if self._iframe_resolver is None:
             self._iframe_resolver = IFrameContextResolver(self)
         return self._iframe_resolver
+
+    @property
+    def attributes(self) -> dict[str, str]:
+        """Read-only copy of the element's cached attributes."""
+        return dict(self._attributes)
 
     @property
     def value(self) -> Optional[str]:
@@ -146,7 +169,7 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
     @property
     def is_iframe(self) -> bool:
         """Whether the element represents an iframe."""
-        return self.tag_name == 'iframe'
+        return self.tag_name in {'iframe', 'frame'}
 
     @property
     def is_enabled(self) -> bool:
@@ -204,17 +227,15 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
 
         The context includes: frame_id, document_url, execution_context_id,
         document_object_id and, for OOPIF targets, the session_id and
-        session_handler used for routing commands. The first call resolves and
-        caches the context. Non-iframe elements return None.
+        session_handler used for routing commands. The context is always freshly
+        resolved to avoid stale execution contexts after iframe navigations or
+        reloads. Non-iframe elements return None.
 
         Returns:
-            IFrameContext | None: Cached iframe context or None for non-iframes.
+            IFrameContext | None: Resolved iframe context or None for non-iframes.
         """
         if not self.is_iframe:
             return None
-
-        if self._iframe_context:
-            return self._iframe_context
 
         resolver = self._get_iframe_resolver()
         self._iframe_context = await resolver.resolve()
@@ -254,7 +275,73 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
         object_id = result['result']['result']['objectId']
         attributes = await self._get_object_attributes(object_id=object_id)
         logger.debug(f'Parent element resolved: object_id={object_id}')
-        return WebElement(object_id, self._connection_handler, attributes_list=attributes)
+        return WebElement(
+            object_id, self._connection_handler, attributes_list=attributes, mouse=self._mouse
+        )
+
+    async def get_shadow_root(self, timeout: float = 0) -> ShadowRoot:
+        """
+        Get the shadow root attached to this element.
+
+        Args:
+            timeout: Maximum seconds to wait for the shadow root to appear.
+                When > 0, repeatedly polls (every 0.5s) until a shadow root
+                is found or the timeout expires.
+
+        Returns:
+            ShadowRoot instance for traversing the shadow DOM.
+
+        Raises:
+            ShadowRootNotFound: If no shadow root is attached (when timeout=0).
+            WaitElementTimeout: If timeout > 0 and no shadow root appears
+                within the specified duration.
+        """
+        if not timeout:
+            return await self._get_shadow_root()
+
+        start_time = asyncio.get_event_loop().time()
+        while True:
+            try:
+                return await self._get_shadow_root()
+            except ShadowRootNotFound:
+                pass
+
+            if asyncio.get_event_loop().time() - start_time > timeout:
+                raise WaitElementTimeout(
+                    f'Timed out after {timeout}s waiting for shadow root on element'
+                )
+
+            await asyncio.sleep(0.5)
+
+    async def _get_shadow_root(self) -> ShadowRoot:
+        """Get the shadow root attached to this element (single attempt)."""
+        response: DescribeNodeResponse = await self._execute_command(
+            DomCommands.describe_node(object_id=self._object_id, depth=1, pierce=True)
+        )
+        node_info = response.get('result', {}).get('node', {})
+        shadow_roots = node_info.get('shadowRoots', [])
+        if not shadow_roots:
+            raise ShadowRootNotFound()
+
+        shadow_root_data = shadow_roots[0]
+        backend_node_id = shadow_root_data.get('backendNodeId')
+        if not backend_node_id:
+            raise ShadowRootNotFound('Shadow root found but backend node ID is unavailable')
+
+        resolve_response: ResolveNodeResponse = await self._execute_command(
+            DomCommands.resolve_node(backend_node_id=backend_node_id)
+        )
+        shadow_object_id = resolve_response['result']['object']['objectId']
+
+        mode = ShadowRootType(shadow_root_data.get('shadowRootType', 'open'))
+
+        logger.debug(f'Shadow root resolved: object_id={shadow_object_id}, mode={mode.value}')
+        return ShadowRoot(
+            object_id=shadow_object_id,
+            connection_handler=self._connection_handler,
+            mode=mode,
+            host_element=self,
+        )
 
     async def get_children_elements(
         self, max_depth: int = 1, tag_filter: list[str] = [], raise_exc: bool = False
@@ -471,6 +558,7 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
         x_offset: int = 0,
         y_offset: int = 0,
         hold_time: float = 0.1,
+        humanize: bool = False,
     ):
         """
         Click element using simulated mouse events.
@@ -478,7 +566,11 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
         Args:
             x_offset: Horizontal offset from element center.
             y_offset: Vertical offset from element center.
-            hold_time: Duration to hold mouse button down.
+            hold_time: Duration to hold mouse button down (used when humanize=False).
+            humanize: When True and a Mouse instance is available, uses humanized
+                Bezier curve movement from the current tracked position to the
+                element center before clicking. When False, dispatches raw CDP
+                mousePressed/mouseReleased events directly.
 
         Raises:
             ElementNotVisible: If element is not visible.
@@ -505,14 +597,22 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
         except KeyError:
             element_bounds_js = await self.get_bounds_using_js()
             position_to_click = (
-                element_bounds_js['x'] + element_bounds_js['width'] / 2,
-                element_bounds_js['y'] + element_bounds_js['height'] / 2,
+                element_bounds_js['x'] + element_bounds_js['width'] / 2 + x_offset,
+                element_bounds_js['y'] + element_bounds_js['height'] / 2 + y_offset,
             )
+
+        has_iframe_context = getattr(self, '_iframe_context', None) is not None
+        if humanize and self._mouse is not None and not has_iframe_context:
+            logger.info(
+                f'Clicking element (humanized): x={position_to_click[0]}, y={position_to_click[1]}'
+            )
+            await self._mouse.click(position_to_click[0], position_to_click[1], humanize=True)
+            return
+
         logger.info(
             f'Clicking element: x={position_to_click[0]}, '
             f'y={position_to_click[1]}, hold={hold_time}s'
         )
-
         press_command = InputCommands.dispatch_mouse_event(
             type=MouseEventType.MOUSE_PRESSED,
             x=int(position_to_click[0]),
@@ -527,9 +627,32 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
             button=MouseButton.LEFT,
             click_count=1,
         )
-        await self._connection_handler.execute_command(press_command)
+        await self._execute_command(press_command)
         await asyncio.sleep(hold_time)
-        await self._connection_handler.execute_command(release_command)
+        await self._execute_command(release_command)
+
+    async def focus(self):
+        """Focus this element via CDP DOM.focus command."""
+        await self._execute_command(DomCommands.focus(object_id=self._object_id))
+
+    async def clear(self):
+        """
+        Clear the current value of the element.
+
+        Supports standard inputs, textareas, and contenteditable elements.
+        Dispatches ``input`` and ``change`` events so frameworks detect the update.
+
+        Raises:
+            ElementNotInteractable: If the element does not accept text input.
+        """
+        logger.info('Clearing element value')
+        result = await self.execute_script(Scripts.CLEAR_INPUT, return_by_value=True)
+        success = result['result'].get('result', {}).get('value', False)
+        if not success:
+            logger.error('Element does not accept text input')
+            raise ElementNotInteractable('Element does not accept text input')
+        if self._attributes.get('tag_name', '').lower() in {'input', 'textarea'}:
+            self._attributes['value'] = ''
 
     async def insert_text(self, text: str):
         """
@@ -601,7 +724,7 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
             interval: Deprecated. Use humanize=True instead.
         """
         logger.info(f'Typing text (length={len(text)}, humanize={humanize})')
-        await self.click()
+        await self.click(humanize=humanize)
         keyboard = self._get_keyboard()
         await keyboard.type_text(text, humanize=humanize, interval=interval)
 
@@ -696,17 +819,23 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
     async def is_visible(self):
         """Check if element is visible using comprehensive JavaScript visibility test."""
         result = await self.execute_script(Scripts.ELEMENT_VISIBLE, return_by_value=True)
-        return bool(result['result']['result']['value'])
+        if 'error' in result:
+            return False
+        return bool(result.get('result', {}).get('result', {}).get('value', False))
 
     async def is_on_top(self):
         """Check if element is topmost at its center point (not covered by overlays)."""
         result = await self.execute_script(Scripts.ELEMENT_ON_TOP, return_by_value=True)
-        return result['result']['result']['value']
+        if 'error' in result:
+            return False
+        return bool(result.get('result', {}).get('result', {}).get('value', False))
 
     async def is_interactable(self):
         """Check if element is interactable based on visibility and position."""
         result = await self.execute_script(Scripts.ELEMENT_INTERACTIVE, return_by_value=True)
-        return result['result']['result']['value']
+        if 'error' in result:
+            return False
+        return bool(result.get('result', {}).get('result', {}).get('value', False))
 
     async def execute_script(
         self,
@@ -815,11 +944,18 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
         return response['result']['result'].get('value', '')
 
     def _apply_routing_from_context(self) -> None:
-        """Apply routing attributes from iframe context."""
-        if hasattr(self, '_routing_session_handler'):
-            delattr(self, '_routing_session_handler')
-        if hasattr(self, '_routing_session_id'):
-            delattr(self, '_routing_session_id')
+        """Apply routing attributes from iframe context.
+
+        After iframe context resolution, commands targeting the *content* of
+        the iframe should route through ``_iframe_context`` (handled by
+        ``_resolve_routing`` which prioritises ``_iframe_context`` over
+        ``_routing_session_*``).
+
+        The ``_routing_session_handler`` / ``_routing_session_id`` attributes
+        must be preserved: they identify the parent OOPIF session where the
+        ``<iframe>`` *element itself* lives.  The resolver needs them to
+        re-describe the element on subsequent re-resolutions.
+        """
 
     async def _click_option_tag(self):
         """Specialized method for clicking <option> elements in dropdowns."""
@@ -866,7 +1002,12 @@ class WebElement(FindElementsMixin):  # noqa: PLR0904
             child_object_id = prop['value']['objectId']
             attributes = await self._get_object_attributes(object_id=child_object_id)
             family_elements.append(
-                WebElement(child_object_id, self._connection_handler, attributes_list=attributes)
+                WebElement(
+                    child_object_id,
+                    self._connection_handler,
+                    attributes_list=attributes,
+                    mouse=self._mouse,
+                )
             )
 
         logger.debug(f'Family elements found: {len(family_elements)}')

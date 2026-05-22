@@ -21,7 +21,9 @@ from pydoll.browser.managers import (
 from pydoll.browser.tab import Tab
 from pydoll.commands import (
     BrowserCommands,
+    EmulationCommands,
     FetchCommands,
+    PageCommands,
     RuntimeCommands,
     StorageCommands,
     TargetCommands,
@@ -38,6 +40,9 @@ from pydoll.exceptions import (
 from pydoll.protocol.browser.types import DownloadBehavior
 from pydoll.protocol.fetch.events import FetchEvent
 from pydoll.protocol.fetch.types import AuthChallengeResponseType
+from pydoll.protocol.target.events import TargetEvent
+from pydoll.protocol.target.types import FilterEntry
+from pydoll.utils.user_agent_parser import ParsedUserAgent, UserAgentParser
 
 if TYPE_CHECKING:
     from tempfile import TemporaryDirectory
@@ -83,6 +88,10 @@ class Browser(ABC):  # noqa: PLR0904
         self,
         options_manager: BrowserOptionsManager,
         connection_port: Optional[int] = None,
+        proxy_manager: Optional[ProxyManager] = None,
+        browser_process_manager: Optional[BrowserProcessManager] = None,
+        temp_directory_manager: Optional[TempDirectoryManager] = None,
+        connection_handler: Optional[ConnectionHandler] = None,
     ):
         """
         Initialize browser instance with configuration.
@@ -91,18 +100,23 @@ class Browser(ABC):  # noqa: PLR0904
             options_manager: Manages browser options initialization and defaults.
                 Must implement initialize_options() and add_default_arguments().
             connection_port: CDP WebSocket port. Random port (9223-9322) if None.
+            proxy_manager: Proxy manager; built from options when omitted.
+            browser_process_manager: Process manager; default when omitted.
+            temp_directory_manager: Temp directory manager; default when omitted.
+            connection_handler: Browser-level connection handler; built from the
+                connection port when omitted (mainly for testing).
 
         Note:
             Call start() to actually launch the browser.
         """
         self._validate_connection_port(connection_port)
         self.options = options_manager.initialize_options()
-        self._proxy_manager = ProxyManager(self.options)
+        self._proxy_manager = proxy_manager or ProxyManager(self.options)
         self._connection_port = connection_port if connection_port else randint(9223, 9322)
-        self._browser_process_manager = BrowserProcessManager()
-        self._temp_directory_manager = TempDirectoryManager()
+        self._browser_process_manager = browser_process_manager or BrowserProcessManager()
+        self._temp_directory_manager = temp_directory_manager or TempDirectoryManager()
         self._ws_address: Optional[str] = None
-        self._connection_handler = ConnectionHandler(self._connection_port)
+        self._connection_handler = connection_handler or ConnectionHandler(self._connection_port)
         self._backup_preferences_dir = ''
         self._tabs_opened: dict[str, Tab] = {}
         self._context_proxy_auth: dict[str, tuple[str, str]] = {}
@@ -193,6 +207,8 @@ class Browser(ABC):  # noqa: PLR0904
         valid_tab_id = await self._get_valid_tab_id(await self.get_targets())
         tab = Tab(self, target_id=valid_tab_id, connection_port=self._connection_port)
         self._tabs_opened[valid_tab_id] = tab
+        await self._setup_worker_user_agent_override()
+        await self._apply_user_agent_override(tab)
         logger.info(f'Initial tab attached: {valid_tab_id}')
         return tab
 
@@ -306,6 +322,7 @@ class Browser(ABC):  # noqa: PLR0904
         target_id = response['result']['targetId']
         tab = Tab(self, **self._get_tab_kwargs(target_id, browser_context_id))
         self._tabs_opened[target_id] = tab
+        await self._apply_user_agent_override(tab)
         await self._setup_context_proxy_auth_for_tab(tab, browser_context_id)
         if url:
             await tab.go_to(url)
@@ -347,10 +364,11 @@ class Browser(ABC):  # noqa: PLR0904
             target_id for target_id in all_target_ids if target_id not in existing_target_ids
         ]
         existing_tabs = [self._tabs_opened[target_id] for target_id in existing_target_ids]
-        new_tabs = [
-            Tab(self, **self._get_tab_kwargs(target_id))
-            for target_id in reversed(remaining_target_ids)
-        ]
+        new_tabs = []
+        for target_id in reversed(remaining_target_ids):
+            tab = Tab(self, **self._get_tab_kwargs(target_id))
+            await self._apply_user_agent_override(tab)
+            new_tabs.append(tab)
         self._tabs_opened.update(dict(zip(remaining_target_ids, new_tabs)))
         logger.debug(
             f'Opened tabs resolved: existing={len(existing_tabs)}, new={len(new_tabs)}',
@@ -358,7 +376,9 @@ class Browser(ABC):  # noqa: PLR0904
         return existing_tabs + new_tabs
 
     async def get_tab_by_target(self, target: TargetInfo) -> Tab:
-        return Tab(self, **self._get_tab_kwargs(target['targetId']))
+        tab = Tab(self, **self._get_tab_kwargs(target['targetId']))
+        await self._apply_user_agent_override(tab)
+        return tab
 
     async def set_download_path(self, path: str, browser_context_id: Optional[str] = None):
         """Set download directory path (convenience method for set_download_behavior)."""
@@ -754,6 +774,127 @@ class Browser(ABC):  # noqa: PLR0904
             temporary=True,
         )
 
+    async def _apply_user_agent_override(self, tab: Tab) -> None:
+        """Apply consistent User-Agent override to a tab if --user-agent= is set.
+
+        Detects the --user-agent= argument in browser options and automatically
+        synchronizes HTTP headers, navigator JS properties, and Client Hints
+        via CDP Emulation.setUserAgentOverride + JS injection.
+        """
+        user_agent = self._get_user_agent_from_options()
+        if not user_agent:
+            return
+
+        parsed = UserAgentParser.parse(user_agent)
+        logger.debug('Applying User-Agent override: %s', user_agent[:60])
+
+        await tab._execute_command(
+            EmulationCommands.set_user_agent_override(
+                user_agent=user_agent,
+                platform=parsed.platform,
+                user_agent_metadata=parsed.user_agent_metadata,
+            )
+        )
+
+        if parsed.navigator_override_js:
+            await tab._execute_command(
+                PageCommands.add_script_to_evaluate_on_new_document(
+                    source=parsed.navigator_override_js,
+                    run_immediately=True,
+                )
+            )
+
+        await tab.on(
+            TargetEvent.ATTACHED_TO_TARGET,
+            self._build_worker_user_agent_handler(parsed, user_agent, tab._connection_handler),
+        )
+        await tab._execute_command(
+            TargetCommands.set_auto_attach(
+                auto_attach=True,
+                wait_for_debugger_on_start=True,
+                flatten=True,
+                filter=[FilterEntry(type='worker')],
+            )
+        )
+
+    async def _setup_worker_user_agent_override(self) -> None:
+        """Propagate the User-Agent override to out-of-page worker targets.
+
+        Emulation.setUserAgentOverride is scoped per target, so service and
+        shared workers (which live in the browser context, not the page) keep
+        the real navigator.platform and navigator.userAgentData unless the
+        override is reapplied to their own sessions. This auto-attaches to those
+        worker targets at browser level and replays the override before they run.
+        """
+        user_agent = self._get_user_agent_from_options()
+        if not user_agent:
+            return
+
+        parsed = UserAgentParser.parse(user_agent)
+        await self.on(
+            TargetEvent.ATTACHED_TO_TARGET,
+            self._build_worker_user_agent_handler(parsed, user_agent, self._connection_handler),
+        )
+        await self._execute_command(
+            TargetCommands.set_auto_attach(
+                auto_attach=True,
+                wait_for_debugger_on_start=True,
+                flatten=True,
+                filter=[FilterEntry(type='service_worker'), FilterEntry(type='shared_worker')],
+            )
+        )
+
+    @staticmethod
+    def _build_worker_user_agent_handler(
+        parsed: ParsedUserAgent,
+        user_agent: str,
+        connection_handler: ConnectionHandler,
+    ) -> Callable[[dict], Awaitable[None]]:
+        """Build an attachedToTarget handler that replays the UA override on workers.
+
+        The returned coroutine applies Emulation.setUserAgentOverride to each
+        attached worker session and always resumes targets paused via
+        waitForDebuggerOnStart, so a worker never hangs on attach.
+        """
+        worker_types = {'service_worker', 'shared_worker', 'worker'}
+
+        async def on_worker_attached(event: dict) -> None:
+            params = event['params']
+            session_id = params['sessionId']
+            target_type = params['targetInfo']['type']
+            try:
+                if target_type in worker_types:
+                    override = EmulationCommands.set_user_agent_override(
+                        user_agent=user_agent,
+                        platform=parsed.platform,
+                        user_agent_metadata=parsed.user_agent_metadata,
+                    )
+                    override['sessionId'] = session_id
+                    await connection_handler.execute_command(override)
+                    if parsed.navigator_override_js:
+                        inject = RuntimeCommands.evaluate(expression=parsed.navigator_override_js)
+                        inject['sessionId'] = session_id
+                        await connection_handler.execute_command(inject)
+            except Exception:
+                logger.exception(
+                    'Failed to apply User-Agent override to worker session %s', session_id
+                )
+            finally:
+                if params.get('waitingForDebugger'):
+                    resume = RuntimeCommands.run_if_waiting_for_debugger()
+                    resume['sessionId'] = session_id
+                    with suppress(Exception):
+                        await connection_handler.execute_command(resume)
+
+        return on_worker_attached
+
+    def _get_user_agent_from_options(self) -> Optional[str]:
+        """Extract User-Agent value from --user-agent= browser argument."""
+        for arg in self.options.arguments:
+            if arg.startswith('--user-agent='):
+                return arg[len('--user-agent=') :]
+        return None
+
     async def _verify_browser_running(self):
         """
         Verify browser started successfully.
@@ -836,7 +977,7 @@ class Browser(ABC):  # noqa: PLR0904
         return False
 
     async def _execute_command(
-        self, command: Command[T_CommandParams, T_CommandResponse], timeout: int = 10
+        self, command: Command[T_CommandParams, T_CommandResponse], timeout: int = 60
     ) -> T_CommandResponse:
         """Execute CDP command and return result (core method for browser communication)."""
         logger.debug(f'Executing command: {command.get("method")} (timeout={timeout})')
@@ -906,9 +1047,9 @@ class Browser(ABC):  # noqa: PLR0904
     def _validate_ws_address(ws_address: str):
         """Validate WebSocket address."""
         min_slashes = 4
-        if not ws_address.startswith('ws://'):
-            logger.error('Invalid WebSocket address: missing ws:// prefix')
-            raise InvalidWebSocketAddress('WebSocket address must start with ws://')
+        if not ws_address.startswith(('ws://', 'wss://')):
+            logger.error('Invalid WebSocket address: missing ws:// or wss:// prefix')
+            raise InvalidWebSocketAddress('WebSocket address must start with ws:// or wss://')
         if len(ws_address.split('/')) < min_slashes:
             logger.error('Invalid WebSocket address: not enough slashes')
             raise InvalidWebSocketAddress(
